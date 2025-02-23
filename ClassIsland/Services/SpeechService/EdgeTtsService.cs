@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -27,7 +27,7 @@ public class EdgeTtsService : ISpeechService
 
     private SettingsService SettingsService { get; } = App.GetService<SettingsService>();
 
-    private List<eVoice> Voices { get; } = Edge_tts.GetVoice();
+    private List<eVoice> Voices { get; } = EdgeTts.GetVoice();
 
     private Queue<EdgeTtsPlayInfo> PlayingQueue { get; } = new();
 
@@ -81,7 +81,11 @@ public class EdgeTtsService : ISpeechService
                     var completed = false;
                     var voice = Voices.Find(voice => voice.ShortName == SettingsService.Settings.EdgeTtsVoiceName);
                     var completeHandle = new CancellationTokenSource();
-                    Edge_tts.Invoke(text, voice, 0, (Action<List<byte>>)(binary =>
+                    var options = new PlayOption()
+                    {
+                        Text = text
+                    };
+                    EdgeTts.Invoke(options, voice, (Action<List<byte>>)(binary =>
                     {
                         if (completeHandle.IsCancellationRequested)
                             return;
@@ -158,7 +162,6 @@ public class EdgeTtsService : ISpeechService
             {
                 Logger.LogError(ex, "无法播放语音。");
             }
-
         }
 
         CurrentWavePlayer?.Dispose();

@@ -6,16 +6,24 @@ using System.CommandLine;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Forms;
 using ClassIsland;
 using ClassIsland.Services;
 using ClassIsland.Shared.IPC;
 using ClassIsland.Shared.IPC.Abstractions.Services;
 using dotnetCampus.Ipc.CompilerServices.GeneratedProxies;
+using Microsoft.Win32;
 using Sentry;
 using NAudio;
+using Clipboard = System.Windows.Clipboard;
+using CommonDialog = System.Windows.Forms.CommonDialog;
+using MessageBox = System.Windows.MessageBox;
 
 Thread.CurrentThread.SetApartmentState(ApartmentState.Unknown);
 Thread.CurrentThread.SetApartmentState(ApartmentState.STA);
+
+AppDomain.CurrentDomain.UnhandledException += DiagnosticService.ProcessDomainUnhandledException;
 
 var command = new RootCommand
 {
@@ -27,7 +35,9 @@ var command = new RootCommand
     new Option<bool>(["-prevSessionMemoryKilled", "-psmk"], "上个会话因MLE结束。"),
     new Option<bool>(["-disableManagement", "-dm"], "在本次会话禁用集控。"),
     new Option<string>(["-externalPluginPath", "-epp"], "外部插件路径"),
-    new Option<bool>(["--enableSentryDebug", "-esd"], "启用 Sentry 调试")
+    new Option<bool>(["--enableSentryDebug", "-esd"], "启用 Sentry 调试"),
+    new Option<bool>(["--verbose", "-v"], "启用详细输出"),
+    new Option<bool>(["--showOssWatermark", "-ossw"], "显示开源地址水印")
 };
 command.Handler = CommandHandler.Create((ApplicationCommand c) => { App.ApplicationCommand = c; });
 command.Invoke(args);
@@ -70,6 +80,7 @@ void ConfigureSentry(SentryOptions options)
     // This option is recommended. It enables Sentry's "Release Health" feature.
     options.AutoSessionTracking = true;
     options.Release = App.AppVersion;
+    options.SendClientReports = false;
     // Enabling this option is recommended for client applications only. It ensures all threads use the same global scope.
     options.IsGlobalModeEnabled = true;
     // Example sample rate for your transactions: captures 10% of transactions
@@ -80,11 +91,10 @@ void ConfigureSentry(SentryOptions options)
     }
     else
     {
-        options.TracesSampleRate = 0.1;
+        options.TracesSampleRate = 0.05;
         // options.ProfilesSampleRate = 0.016;
     }
 
-    options.AutoSessionTracking = true;
     options.ExperimentalMetrics = new ExperimentalMetricsOptions { EnableCodeLocations = true };
 }
 
@@ -106,6 +116,9 @@ var app = new App()
 app.InitializeComponent();
 app.Run();
 return;
+
+
+
 
 static async Task ProcessUriNavigationAsync()
 {

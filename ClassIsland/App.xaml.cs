@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.CommandLine;
 using System.CommandLine.NamingConventionBinder;
@@ -9,6 +9,7 @@ using System.Linq;
 using System.Reflection;
 using System.Speech.Synthesis;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Diagnostics;
@@ -61,10 +62,26 @@ using ClassIsland.Shared.IPC;
 using Sentry;
 using ClassIsland.Core.Controls.Ruleset;
 using ClassIsland.Models.Rules;
+using ClassIsland.Models.Actions;
 using ClassIsland.Controls.RuleSettingsControls;
 using ClassIsland.Shared.IPC.Abstractions.Services;
 using dotnetCampus.Ipc.CompilerServices.GeneratedProxies;
 using ControlzEx.Native;
+using ClassIsland.Controls.ActionSettingsControls;
+using ClassIsland.Controls.AuthorizeProvider;
+using ClassIsland.Core.Enums;
+using ClassIsland.Services.ActionHandlers;
+using System.Diagnostics.Tracing;
+#if IsMsix
+using Windows.ApplicationModel;
+using Windows.Storage;
+#endif
+using ClassIsland.Services.Automation.Triggers;
+using ClassIsland.Controls.TriggerSettingsControls;
+using ClassIsland.Models.Automation.Triggers;
+using MahApps.Metro.Controls;
+using Walterlv.Threading;
+using Walterlv.Windows;
 
 namespace ClassIsland;
 /// <summary>
@@ -72,6 +89,8 @@ namespace ClassIsland;
 /// </summary>
 public partial class App : AppBase, IAppHost
 {
+    internal Dispatcher? ThreadedUiDispatcher { get; set; }
+
     public static bool IsAssetsTrimmedInternal { get; } =
 #if TrimAssets 
         true;
@@ -85,22 +104,79 @@ public partial class App : AppBase, IAppHost
     private ILogger<App>? Logger { get; set; }
     //public static IHost? Host;
 
+    public static readonly string AppRootFolderPath =
+#if IsMsix
+        ApplicationData.Current.LocalFolder.Path;
+#else
+        "./";
+#endif
     public static readonly string AppDataFolderPath =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClassIsland");
 
-    public static readonly string AppLogFolderPath = "./Logs";
+    public static readonly string AppLogFolderPath = Path.Combine(AppRootFolderPath, "Logs");
 
-    public static readonly string AppConfigPath = "./Config";
+    public static readonly string AppConfigPath = Path.Combine(AppRootFolderPath, "Config");
 
-    public static readonly string AppCacheFolderPath = "./Cache";
+    public static readonly string AppCacheFolderPath =
+#if IsMsix
+        ApplicationData.Current.LocalCacheFolder.Path;
+#else
+        Path.Combine(AppRootFolderPath, "Cache");
+#endif
+
+    public static readonly string AppTempFolderPath =
+#if IsMsix
+        ApplicationData.Current.TemporaryFolder.Path;
+#else
+        Path.Combine(AppRootFolderPath, "Temp");
+#endif
 
     public static T GetService<T>() => IAppHost.GetService<T>();
 
     public bool IsSentryEnabled { get; set; } = false;
 
+    private bool _isStartedCompleted = false;
+
+    internal static bool _isCriticalSafeModeEnabled = false;
+
+    public override bool IsDevelopmentBuild =>
+#if DevelopmentBuild
+        true
+#else
+        false
+#endif
+    ;
+
+    public override bool IsMsix => _isMsix;
+
+    public static readonly bool _isMsix =
+#if IsMsix
+        true
+#else
+        false
+#endif
+    ;
+
+    public override string OperatingSystem => "windows";
+    public override string Platform =>
+#if TARGET_x64
+    "x64"
+#elif PLATFORM_x86
+    "x86"
+#elif PLATFORM_ARM64
+    "arm64"
+#elif PLATFORM_ARM
+    "arm"
+#elif PLATFORM_Any
+    "any"
+#else
+    "unknown"
+#endif
+        ;
     public App()
     {
         //AppContext.SetSwitch("Switch.System.Windows.Input.Stylus.EnablePointerSupport", true);
+        //TaskScheduler.UnobservedTaskException += TaskSchedulerOnUnobservedTaskException;
     }
 
     static App()
@@ -111,6 +187,15 @@ public partial class App : AppBase, IAppHost
             null);
     }
 
+    private void TaskSchedulerOnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        e.SetObserved();
+        Dispatcher.Invoke(() =>
+        {
+            ProcessUnhandledException(e.Exception);
+        });
+    }
+
     public static ApplicationCommand ApplicationCommand
     {
         get;
@@ -119,50 +204,77 @@ public partial class App : AppBase, IAppHost
 
     public Settings Settings { get; set; } = new();
 
-    public static string AppVersion => Assembly.GetExecutingAssembly().GetName().Version!.ToString();
-
-    public static string AppCodeName => "Griseo";
-
-    public static string AppVersionLong =>
-        $"{AppVersion}-{AppCodeName}-{ThisAssembly.Git.Commit}({ThisAssembly.Git.Branch}) (Core {IAppHost.CoreVersion})";
-
     private void App_OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
+        try
+        {
+            ProcessUnhandledException(e.Exception);
+        }
+        catch
+        {
+            Exit += (_, _) =>
+            {
+                DiagnosticService.ProcessCriticalException(e.Exception);
+            };
+            Stop();
+        }
         e.Handled = true;
+    }
 
+    internal void ProcessUnhandledException(Exception e, bool critical=false)
+    {
 #if DEBUG
-        if (e.Exception.GetType() == typeof(ResourceReferenceKeyNotFoundException))
+        if (e.GetType() == typeof(ResourceReferenceKeyNotFoundException))
         {
             return;
         }
 #endif
 
-        if (Settings.IsCriticalSafeMode) // 教学安全模式
+        var safe = _isCriticalSafeModeEnabled && (!(IAppHost.TryGetService<IWindowRuleService>()?.IsForegroundWindowClassIsland() ?? false));
+        if (safe)
         {
-            Logger?.LogCritical(e.Exception, "发生严重错误（应用被教学安全模式退出）");
-            // TODO: 保存错误日志
-            AppBase.Current.Stop();
-            return;
+            Logger?.LogCritical(e, "发生严重错误（应用被教学安全模式退出）");
+            Task.Run(async () =>
+            {
+                await Task.Delay(4000);
+                AppBase.Current.Stop();
+                Application.Current.Shutdown();
+            });
+        }
+        else
+        {
+            Logger?.LogCritical(e, "发生严重错误。");
         }
 
-        Logger?.LogCritical(e.Exception, "发生严重错误。");
+        // wtf ↓
+        //if (CrashWindow != null)
+        //{
+        //    CrashWindow = null;
+        //    GC.Collect();
+        //}
 
-        if (CrashWindow != null)
-        {
-            CrashWindow = null;
-            GC.Collect();
-        }
         //Settings.DiagnosticCrashCount++;
         //Settings.DiagnosticLastCrashTime = DateTime.Now;
         CrashWindow = new CrashWindow()
         {
-            CrashInfo = e.Exception.ToString()
+            CrashInfo = e.ToString(),
+            AllowIgnore = _isStartedCompleted && !critical,
+            IsCritical = critical
         };
-        SentrySdk.CaptureException(e.Exception, scope =>
+        if (!critical)  // 全局未捕获的异常应该由 SentrySdk 自行捕获。
         {
-            scope.Level = SentryLevel.Fatal;    
-        });
-        CrashWindow.ShowDialog();
+            SentrySdk.CaptureException(e, scope =>
+            {
+                scope.Level = SentryLevel.Fatal;
+            });
+        }
+        if (!safe)
+            CrashWindow.ShowDialog();
+        else
+        {
+            AppBase.Current.Stop();
+            Application.Current.Shutdown();
+        }
     }
 
     private async void App_OnStartup(object sender, StartupEventArgs e)
@@ -173,6 +285,7 @@ public partial class App : AppBase, IAppHost
         );
         SentrySdk.ConfigureScope(s => s.Transaction = transaction);
         var spanPreInit = transaction.StartChild("startup-init");
+        MyWindow.ShowOssWatermark = ApplicationCommand.ShowOssWatermark;
         ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
         //DependencyPropertyHelper.ForceOverwriteDependencyPropertyDefaultValue(FrameworkElement.FocusVisualStyleProperty,
         //    Resources[SystemParameters.FocusVisualStyleKey]);
@@ -223,8 +336,9 @@ public partial class App : AppBase, IAppHost
         // 检测目录是否可以访问
         try
         {
-            await File.WriteAllTextAsync("./.test-write", "");
-            File.Delete("./.test-write");
+            var testWritePath = Path.Combine(AppRootFolderPath, "./.test-write");
+            await File.WriteAllTextAsync(testWritePath, "");
+            File.Delete(testWritePath);
         }
         catch (Exception ex)
         {
@@ -295,7 +409,9 @@ public partial class App : AppBase, IAppHost
                 services.AddSingleton<IPluginService, PluginService>();
                 services.AddSingleton<IPluginMarketService, PluginMarketService>();
                 services.AddSingleton<IRulesetService, RulesetService>();
+                services.AddSingleton<IActionService, ActionService>();
                 services.AddSingleton<IWindowRuleService, WindowRuleService>();
+                services.AddSingleton<IAutomationService, AutomationService>();
                 try // 检测SystemSpeechService是否存在
                 {
                     var s = new SpeechSynthesizer();
@@ -315,6 +431,7 @@ public partial class App : AppBase, IAppHost
                         {
                             0 => new SystemSpeechService(),
                             1 => new EdgeTtsService(),
+                            2 => new GptSoVitsService(),
                             _ => new SystemSpeechService()
                         };
                     }
@@ -322,16 +439,19 @@ public partial class App : AppBase, IAppHost
                     {
                         return new EdgeTtsService();
                     }
-                    
                 }));
                 services.AddSingleton<IExactTimeService, ExactTimeService>();
                 //services.AddSingleton(typeof(ApplicationCommand), ApplicationCommand);
+                services.AddSingleton<IProfileAnalyzeService, ProfileAnalyzeService>();
                 services.AddSingleton<IIpcService, IpcService>();
+                services.AddSingleton<IAuthorizeService, AuthorizeService>();
+                services.AddSingleton<UriTriggerHandlerService>();
+                services.AddSingleton<SignalTriggerHandlerService>();
                 // Views
                 services.AddSingleton<MainWindow>();
                 services.AddSingleton<SplashWindow>();
                 services.AddTransient<FeatureDebugWindow>();
-                services.AddSingleton<TopmostEffectWindow>();
+                services.AddSingleton<TopmostEffectWindow>(BuildTopmostEffectWindow);
                 services.AddSingleton<AppLogsWindow>();
                 services.AddSingleton<SettingsWindowNew>();
                 services.AddSingleton<ProfileSettingsWindow>((s) => new ProfileSettingsWindow()
@@ -339,7 +459,7 @@ public partial class App : AppBase, IAppHost
                     MainViewModel = s.GetService<MainWindow>()?.ViewModel ?? new()
                 });
                 services.AddTransient<ClassPlanDetailsWindow>();
-                services.AddSingleton<IProfileAnalyzeService, ProfileAnalyzeService>();
+                services.AddTransient<WindowRuleDebugWindow>();
                 // 设置页面
                 services.AddSettingsPage<GeneralSettingsPage>();
                 services.AddSettingsPage<ComponentsSettingsPage>();
@@ -348,6 +468,7 @@ public partial class App : AppBase, IAppHost
                 services.AddSettingsPage<WindowSettingsPage>();
                 services.AddSettingsPage<WeatherSettingsPage>();
                 services.AddSettingsPage<UpdatesSettingsPage>();
+                services.AddSettingsPage<AutomationSettingsPage>();
                 services.AddSettingsPage<StorageSettingsPage>();
                 services.AddSettingsPage<PrivacySettingsPage>();
                 services.AddSettingsPage<PluginsSettingsPage>();
@@ -355,6 +476,9 @@ public partial class App : AppBase, IAppHost
                 services.AddSettingsPage<DebugPage>();
                 services.AddSettingsPage<DebugBrushesSettingsPage>();
                 services.AddSettingsPage<AboutSettingsPage>();
+                services.AddSettingsPage<ManagementSettingsPage>();
+                services.AddSettingsPage<ManagementCredentialsSettingsPage>();
+                services.AddSettingsPage<ManagementPolicySettingsPage>();
                 // 主界面组件
                 services.AddComponent<TextComponent, TextComponentSettingsControl>();
                 services.AddComponent<SeparatorComponent>();
@@ -363,11 +487,14 @@ public partial class App : AppBase, IAppHost
                 services.AddComponent<ClockComponent, ClockComponentSettingsControl>();
                 services.AddComponent<WeatherComponent, WeatherComponentSettingsControl>();
                 services.AddComponent<CountDownComponent, CountDownComponentSettingsControl>();
+                services.AddComponent<SlideComponent, SlideComponentSettingsControl>();
+                services.AddComponent<GroupComponent>();
                 // 提醒提供方
                 services.AddHostedService<ClassNotificationProvider>();
                 services.AddHostedService<AfterSchoolNotificationProvider>();
                 services.AddHostedService<WeatherNotificationProvider>();
                 services.AddHostedService<ManagementNotificationProvider>();
+                services.AddHostedService<ActionNotificationProvider>();
                 // Transients
                 services.AddTransient<ExcelImportWindow>();
                 services.AddTransient<WallpaperPreviewWindow>();
@@ -380,9 +507,14 @@ public partial class App : AppBase, IAppHost
                         o.InitializeSdk = false;
                         o.MinimumBreadcrumbLevel = LogLevel.Information;
                     });
+                    var debug = false;
 #if DEBUG
-                    builder.SetMinimumLevel(LogLevel.Trace);
+                    debug = true;
 #endif
+                    if (ApplicationCommand.Verbose || debug)
+                    {
+                        builder.SetMinimumLevel(LogLevel.Trace);
+                    }
                 });
                 services.AddSingleton<ILoggerProvider, SentryLoggerProvider>();
                 services.AddSingleton<ILoggerProvider, AppLoggerProvider>();
@@ -392,15 +524,49 @@ public partial class App : AppBase, IAppHost
                 services.AddAttachedSettingsControl<ClassNotificationAttachedSettingsControl>();
                 services.AddAttachedSettingsControl<LessonControlAttachedSettingsControl>();
                 services.AddAttachedSettingsControl<WeatherNotificationAttachedSettingsControl>();
+                // 触发器
+                services.AddTrigger<SignalTrigger, SignalTriggerSettingsControl>();
+                services.AddTrigger<UriTrigger, UriTriggerSettingsControl>();
+                services.AddTrigger<RulesetChangedTrigger>();
+                services.AddTrigger<CronTrigger, CronTriggerSettingsControl>();
+                services.AddTrigger<AppStartupTrigger>();
+                services.AddTrigger<AppStoppingTrigger>();
+                services.AddTrigger<OnClassTrigger>();
+                services.AddTrigger<OnBreakingTimeTrigger>();
+                services.AddTrigger<OnAfterSchoolTrigger>();
+                services.AddTrigger<CurrentTimeStateChangedTrigger>();
                 // 规则
-                //services.AddRule("classisland.test.true", "总是为真", onHandle: _ => true);
-                //services.AddRule("classisland.test.false", "总是为假", onHandle: _ => false);
+                services.AddRule("classisland.test.true", "总是为真", onHandle: _ => true);
+                services.AddRule("classisland.test.false", "总是为假", onHandle: _ => false);
                 services.AddRule<StringMatchingSettings, RulesetStringMatchingSettingsControl>("classisland.windows.className", "前台窗口类名", PackIconKind.WindowMaximize);
                 services.AddRule<StringMatchingSettings, RulesetStringMatchingSettingsControl>("classisland.windows.text", "前台窗口标题", PackIconKind.FormatTitle);
                 services.AddRule<WindowStatusRuleSettings, WindowStatusRuleSettingsControl>("classisland.windows.status", "前台窗口状态是", PackIconKind.DockWindow);
                 services.AddRule<StringMatchingSettings, RulesetStringMatchingSettingsControl>("classisland.windows.processName", "前台窗口进程", PackIconKind.ApplicationCogOutline);
                 services.AddRule<CurrentSubjectRuleSettings, CurrentSubjectRuleSettingsControl>("classisland.lessons.currentSubject", "科目是", PackIconKind.BookOutline);
+                services.AddRule<CurrentSubjectRuleSettings, CurrentSubjectRuleSettingsControl>("classisland.lessons.nextSubject", "下节课科目是", PackIconKind.BookArrowRightOutline);
+                services.AddRule<CurrentSubjectRuleSettings, CurrentSubjectRuleSettingsControl>("classisland.lessons.previousSubject", "上节课科目是", PackIconKind.BookArrowLeftOutline);
                 services.AddRule<TimeStateRuleSettings, TimeStateRuleSettingsControl>("classisland.lessons.timeState", "当前时间状态是", PackIconKind.ClockOutline);
+                services.AddRule<CurrentWeatherRuleSettings, CurrentWeatherRuleSettingsControl>("classisland.weather.currentWeather", "当前天气是", PackIconKind.WeatherCloudy);
+                services.AddRule<StringMatchingSettings, RulesetStringMatchingSettingsControl>("classisland.weather.hasWeatherAlert", "存在气象预警", PackIconKind.WeatherCloudyAlert);
+                services.AddRule<RainTimeRuleSettings, RainTimeRuleSettingsControl>("classisland.weather.rainTime", "距离降水开始/结束还剩", PackIconKind.WeatherHeavyRain);
+                // 行动
+                services.AddAction<SignalTriggerSettings, BroadcastSignalActionSettingsControl>("classisland.broadcastSignal", "广播信号", PackIconKind.Broadcast);
+                services.AddAction<CurrentComponentConfigActionSettings, CurrentComponentConfigActionSettingsControl>("classisland.settings.currentComponentConfig", "组件配置方案", PackIconKind.WidgetsOutline);
+                services.AddAction<ThemeActionSettings, ThemeActionSettingsControl>("classisland.settings.theme", "应用主题", PackIconKind.ThemeLightDark);
+                services.AddAction<WindowDockingLocationActionSettings, WindowDockingLocationActionSettingsControl>("classisland.settings.windowDockingLocation", "窗口停靠位置", PackIconKind.Monitor);
+                services.AddAction<RunActionSettings, RunActionSettingsControl>("classisland.os.run", "运行", PackIconKind.OpenInApp);
+                services.AddAction<NotificationActionSettings, NotificationActionSettingsControl>(
+                    "classisland.showNotification", "显示提醒", PackIconKind.BellOutline);
+                services.AddAction<SleepActionSettings, SleepActionSettingsControl>("classisland.action.sleep", "等待时长", PackIconKind.TimerSand);
+                services.AddAction<WeatherNotificationActionSettings, WeatherNotificationActionSettingControl>(
+                    "classisland.notification.weather", "显示天气提醒", PackIconKind.SunWirelessOutline);
+                services.AddAction("classisland.app.quit", "退出 ClassIsland", PackIconKind.ExitToApp, (_, _) => Current.Stop());
+                // 行动处理
+                services.AddHostedService<RunActionHandler>();
+                services.AddHostedService<AppSettingsActionHandler>();
+                services.AddHostedService<SleepActionHandler>();
+                // 认证提供方
+                services.AddAuthorizeProvider<PasswordAuthorizeProvider>();
                 // Plugins
                 PluginService.InitializePlugins(context, services);
             }).Build();
@@ -411,6 +577,11 @@ public partial class App : AppBase, IAppHost
         lifetime.ApplicationStopping.Register(() => Logger.LogInformation("App stopping."));
         lifetime.ApplicationStopped.Register(() => Logger.LogInformation("App stopped."));
         lifetime.ApplicationStopping.Register(Stop);
+        if (ApplicationCommand.Verbose)
+        {
+            AppDomain.CurrentDomain.FirstChanceException += (o, args) => Logger.LogTrace(args.Exception, "发生内部异常");
+            AppDomain.CurrentDomain.AssemblyLoad += (o, args) => Logger.LogTrace("加载程序集：{} ({})", args.LoadedAssembly.FullName, args.LoadedAssembly.Location);
+        }
 #if DEBUG
         MemoryProfiler.GetSnapshot("Host built");
 #endif
@@ -436,6 +607,15 @@ public partial class App : AppBase, IAppHost
         }
         spanLoadingSettings.Finish();
         //OverrideFocusVisualStyle();
+        var threadedUiDispatcherAwaiter =
+            AsyncBox.RelatedAsyncDispatchers.GetOrAdd(Dispatcher, dispatcher => UIDispatcher.RunNewAsync("AsyncBox"));
+        await Task.Run(() =>
+        {
+            while (!threadedUiDispatcherAwaiter.IsCompleted)
+            {
+            }
+        });
+        ThreadedUiDispatcher = threadedUiDispatcherAwaiter.Result;
         Logger.LogInformation("初始化应用。");
 
         TransitionAssist.DisableTransitionsProperty.OverrideMetadata(typeof(FrameworkElement), new FrameworkPropertyMetadata(Settings.IsTransientDisabled));
@@ -444,26 +624,21 @@ public partial class App : AppBase, IAppHost
         if (Settings.IsSplashEnabled && !ApplicationCommand.Quiet)
         {
             var spanShowSplash = spanLaunching.StartChild("startup-show-splash");
-            GetService<SplashWindow>().Show();
-            GetService<ISplashService>().CurrentProgress = 25;
-            var b = false;
-            while (!b && !IThemeService.IsWaitForTransientDisabled)
+
+            ThreadedUiDispatcher.Invoke(() =>
             {
-                Dispatcher.Invoke(DispatcherPriority.Background, () =>
-                {
-                    b = GetService<SplashWindow>().IsRendered;
-                });
-                //Console.WriteLine(b);
-                await Dispatcher.Yield(DispatcherPriority.Background);
-            }
+                GetService<SplashWindow>().Show();
+            });
             spanShowSplash.Finish();
         }
-        GetService<ISplashService>().CurrentProgress = 50;
+        GetService<ISplashService>().CurrentProgress = 30;
+        GetService<ISplashService>().SetDetailedStatus("正在启动挂起检查服务");
 
         var spanStartHangService = spanLaunching.StartChild("startup-start-hang-service");
         GetService<IHangService>();
         spanStartHangService.Finish();
 
+        GetService<ISplashService>().SetDetailedStatus("正在创建任务栏图标");
         var spanCreateTaskbarIcon = spanLaunching.StartChild("startup-create-taskbar-icon");
         try
         {
@@ -476,14 +651,9 @@ public partial class App : AppBase, IAppHost
             spanCreateTaskbarIcon.Finish(ex);
         }
 
-        if (ApplicationCommand.UpdateDeleteTarget != null)
-        {
-            GetService<SettingsService>().Settings.LastUpdateStatus = UpdateStatus.UpToDate;
-            GetService<ITaskBarIconService>().MainTaskBarIcon.ShowNotification("更新完成。", $"应用已更新到版本{AppVersion}。点击此处以查看更新日志。");
-        }
-
         if (!ApplicationCommand.Quiet)  // 在静默启动时不进行更新相关操作
         {
+            GetService<ISplashService>().SetDetailedStatus("正在进行更新服务启动操作");
             var spanCheckUpdate = spanLaunching.StartChild("startup-process-update");
             var r = await GetService<UpdateService>().AppStartup();
             spanCheckUpdate.Finish();
@@ -493,8 +663,9 @@ public partial class App : AppBase, IAppHost
                 return;
             }
         }
-        GetService<ISplashService>().CurrentProgress = 75;
+        GetService<ISplashService>().CurrentProgress = 45;
 
+        GetService<ISplashService>().SetDetailedStatus("正在加载档案");
         await GetService<IProfileService>().LoadProfileAsync();
         GetService<IWeatherService>();
         GetService<IExactTimeService>();
@@ -504,6 +675,8 @@ public partial class App : AppBase, IAppHost
 
         var spanLoadMainWindow = spanLaunching.StartChild("span-loading-mainWindow");
         Logger.LogInformation("正在初始化MainWindow。");
+        GetService<ISplashService>().SetDetailedStatus("正在启动主界面所需的服务");
+        GetService<ISplashService>().CurrentProgress = 55;
 #if DEBUG
         MemoryProfiler.GetSnapshot("Pre MainWindow init");
 #endif
@@ -511,6 +684,8 @@ public partial class App : AppBase, IAppHost
         MainWindow = mw;
         mw.StartupCompleted += (o, args) =>
         {
+            GetService<ISplashService>().CurrentProgress = 98;
+            GetService<ISplashService>().SetDetailedStatus("正在进行启动后操作");
             // 由于在应用启动时调用 WMI 会导致无法使用触摸，故在应用启动完成后再获取设备统计信息。
             // https://github.com/dotnet/wpf/issues/9752
             if (IsSentryEnabled)
@@ -528,14 +703,22 @@ public partial class App : AppBase, IAppHost
             spanLoadMainWindow.Finish();
             transaction.Finish();
             SentrySdk.ConfigureScope(s => s.Transaction = null);
+            GetService<IAutomationService>();
             GetService<IRulesetService>().NotifyStatusChanged();
+            if (Settings.IsSplashEnabled)
+            {
+                App.GetService<ISplashService>().EndSplash();
+            }
+            _isStartedCompleted = true;
         };
 #if DEBUG
         MemoryProfiler.GetSnapshot("Pre MainWindow show");
 #endif
+        GetService<ISplashService>().CurrentProgress = 80;
+        GetService<ISplashService>().SetDetailedStatus("正在初始化主界面（步骤 2/2）");
         GetService<MainWindow>().Show();
-        GetService<ISplashService>().CurrentProgress = 90;
         GetService<IWindowRuleService>();
+        GetService<SignalTriggerHandlerService>();
 
         // 注册uri导航
         var uriNavigationService = GetService<IUriNavigationService>();
@@ -554,6 +737,22 @@ public partial class App : AppBase, IAppHost
         {
             Logger.LogError(ex, "无法创建自动备份。");
         }
+
+        if (ApplicationCommand.UpdateDeleteTarget != null)
+        {
+            GetService<SettingsService>().Settings.LastUpdateStatus = UpdateStatus.UpToDate;
+            GetService<ITaskBarIconService>().ShowNotification("更新完成。", $"应用已更新到版本{AppVersion}。点击此处以查看更新日志。", clickedCallback:() => uriNavigationService.NavigateWrapped(new Uri("classisland://app/settings/update")));
+        }
+    }
+
+    private TopmostEffectWindow BuildTopmostEffectWindow(IServiceProvider x)
+    {
+        return ThreadedUiDispatcher!.Invoke(() =>
+        {
+            var window = new TopmostEffectWindow(x.GetRequiredService<ILogger<TopmostEffectWindow>>(), x.GetRequiredService<SettingsService>());
+            return window;
+        });
+        
     }
 
     private void UriNavigationCommandExecuted(object sender, ExecutedRoutedEventArgs e)
@@ -583,7 +782,7 @@ public partial class App : AppBase, IAppHost
     {
         var r = new CommonDialogBuilder()
             .SetContent("ClassIsland已经在运行中，请勿重复启动第二个实例。\n\n要访问应用主菜单，请点击任务栏托盘中的应用图标。")
-            .SetBitmapIcon(new Uri("/Assets/HoYoStickers/帕姆_注意.png", UriKind.RelativeOrAbsolute))
+            .SetIconKind(CommonDialogIconKind.Hint)
             .AddAction("退出应用", PackIconKind.ExitToApp)
             .AddAction("重启现有实例", PackIconKind.Restart, true)
             .ShowDialog();
@@ -608,7 +807,6 @@ public partial class App : AppBase, IAppHost
         catch (Exception e)
         {
             CommonDialog.ShowError($"无法重新启动应用，可能当前运行的实例正在以管理员身份运行。请使用任务管理器终止正在运行的实例，然后再试一次。\n\n{e.Message}");
-
         }
     }
 
@@ -692,14 +890,23 @@ public partial class App : AppBase, IAppHost
 
     public override void Stop()
     {
-        Dispatcher.Invoke(() =>
+        Dispatcher.Invoke(async () =>
         {
             AppStopping?.Invoke(this, EventArgs.Empty);
             IAppHost.Host?.Services.GetService<ILessonsService>()?.StopMainTimer();
             IAppHost.Host?.StopAsync(TimeSpan.FromSeconds(5));
             IAppHost.Host?.Services.GetService<SettingsService>()?.SaveSettings("停止当前应用程序。");
+            IAppHost.Host?.Services.GetService<IAutomationService>()?.SaveConfig("停止当前应用程序。");
             IAppHost.Host?.Services.GetService<IProfileService>()?.SaveProfile();
             Current.Shutdown();
+            if (AsyncBox.RelatedAsyncDispatchers.TryGetValue(Dispatcher, out var asyncDispatcherAwaiter))
+            {
+                var asyncDispatcher = await asyncDispatcherAwaiter;
+                if (!asyncDispatcher.HasShutdownStarted)
+                {
+                    asyncDispatcher.InvokeShutdown();
+                }
+            }
             try
             {
                 //ReleaseLock();

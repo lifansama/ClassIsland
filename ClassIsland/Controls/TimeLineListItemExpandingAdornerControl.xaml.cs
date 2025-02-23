@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Controls;
@@ -67,7 +67,7 @@ public partial class TimeLineListItemExpandingAdornerControl
             s.StartSecond = s.EndSecond = newTime;
     }
 
-    static TimeSpan RoundTime(TimeSpan time) => TimeSpan.FromMinutes(time.TotalMinutes - time.TotalMinutes % 5);
+    static TimeSpan RoundTime(TimeSpan time) => TimeSpan.FromMinutes(time.TotalMinutes - (time.TotalMinutes % 5));
     TimeSpan GetDelta(TimeSpan raw, double v) => RoundTime(TimeSpan.FromSeconds(v * 100 / Scale) + raw) - raw;
 
     void ThumbTop_OnDragDelta(object _, DragDeltaEventArgs e)
@@ -78,7 +78,7 @@ public partial class TimeLineListItemExpandingAdornerControl
         if (TimePoint.EndSecond.TimeOfDay > a + d && !(a + d < PrevTimePoint(0)?.EndSecond.TimeOfDay))
         {
             TimePoint.StartSecond += d;
-            if (b?.TimeType == 1 && b.StartSecond < TimePoint.StartSecond)
+            if (b?.TimeType == 1 && b.StartSecond < TimePoint.StartSecond && b.EndSecond.TimeOfDay == a)
                 b.EndSecond = TimePoint.StartSecond;
          // else if (b?.TimeType == 0)
          //     App.GetService<ProfileSettingsWindow>().AddTimeLayoutItem(1, TimePoint.StartSecond, b.EndSecond);
@@ -94,7 +94,7 @@ public partial class TimeLineListItemExpandingAdornerControl
         if (a + d > TimePoint.StartSecond.TimeOfDay && !(NextTimePoint(0)?.StartSecond.TimeOfDay < a + d))
         {
             TimePoint.EndSecond += d;
-            if (b?.TimeType == 1 && TimePoint.StartSecond < b.StartSecond)
+            if (b?.TimeType == 1 && TimePoint.StartSecond < b.StartSecond && b.StartSecond.TimeOfDay == a)
                 b.StartSecond = TimePoint.EndSecond;
          // else if (b?.TimeType == 0)
          //     App.GetService<ProfileSettingsWindow>().AddTimeLayoutItem(1, b.StartSecond, TimePoint.EndSecond);
@@ -113,11 +113,11 @@ public partial class TimeLineListItemExpandingAdornerControl
         var b2 = NextTimePoint();
         TimePoint.StartSecond += d;
         TimePoint.EndSecond   += d;
-        if (b1?.TimeType == 1 && b1.StartSecond < TimePoint.StartSecond)
+        if (b1?.TimeType == 1 && b1.StartSecond < TimePoint.StartSecond && b1.EndSecond.TimeOfDay == a1)
             b1.EndSecond = TimePoint.StartSecond;
      // else if (b1?.TimeType == 0)
      //     App.GetService<ProfileSettingsWindow>().AddTimeLayoutItem(1, b1.EndSecond, TimePoint.StartSecond);
-        if (b2?.TimeType == 1 && TimePoint.StartSecond < b2.StartSecond)
+        if (b2?.TimeType == 1 && TimePoint.StartSecond < b2.StartSecond && b2.StartSecond.TimeOfDay == a2)
             b2.StartSecond = TimePoint.EndSecond;
      // else if (b2?.TimeType == 0)
      //     App.GetService<ProfileSettingsWindow>().AddTimeLayoutItem(1, TimePoint.EndSecond, b2.StartSecond);

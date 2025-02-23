@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 using System.Threading.Tasks;
 using System.Windows.Threading;
@@ -63,9 +63,11 @@ public class ExactTimeService : ObservableRecipient, IExactTimeService
             Logger.LogError(ex, "初始化NtpClient失败。");
             SyncStatusMessage = ex.Message;
         }
-        Sync();
-        UpdateTimerStatus();
-        SystemEvents.TimeChanged += SystemEventsOnTimeChanged;
+        Task.Run(() => {
+            Sync();
+            UpdateTimerStatus();
+            SystemEvents.TimeChanged += SystemEventsOnTimeChanged;
+        });
 
         if (SettingsService.Settings.IsTimeAutoAdjustEnabled)
         {
@@ -129,8 +131,7 @@ public class ExactTimeService : ObservableRecipient, IExactTimeService
         {
             NtpClock = NtpClient.Query();
             var nowBase = SettingsService.Settings.IsExactTimeEnabled ? NtpClock.Now.LocalDateTime : DateTime.Now;
-            //var now = nowBase + TimeSpan.FromSeconds(SettingsService.Settings.TimeOffsetSeconds);
-            if (30 > Math.Abs((nowBase - prev).TotalSeconds) && nowBase < prev)
+            if (Math.Abs((nowBase - prev).TotalSeconds) < 30 && nowBase < prev)
             {
                 NeedWaiting = true;
                 PrevDateTime = prev;
@@ -159,6 +160,7 @@ public class ExactTimeService : ObservableRecipient, IExactTimeService
                 NeedWaiting = false;
             baseTime = now;
         }
-        return baseTime + TimeSpan.FromSeconds(SettingsService.Settings.TimeOffsetSeconds);
+        return baseTime + TimeSpan.FromSeconds(SettingsService.Settings.TimeOffsetSeconds +
+                                               SettingsService.Settings.DebugTimeOffsetSeconds);
     }
 }

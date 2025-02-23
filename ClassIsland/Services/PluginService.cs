@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
@@ -19,7 +19,7 @@ namespace ClassIsland.Services;
 
 public class PluginService : IPluginService
 {
-    public static readonly string PluginsRootPath = @".\Plugins\";
+    public static readonly string PluginsRootPath = Path.Combine(App.AppRootFolderPath, @"Plugins\");
 
     public static readonly string PluginsIndexPath = Path.Combine(App.AppConfigPath, "PluginsIndex");
 
@@ -97,7 +97,11 @@ public class PluginService : IPluginService
             }
 
             var manifestYaml = File.ReadAllText(manifestPath);
-            var manifest = deserializer.Deserialize<PluginManifest>(manifestYaml);
+            var manifest = deserializer.Deserialize<PluginManifest?>(manifestYaml);
+            if (manifest == null)
+            {
+                continue;
+            }
             var info = new PluginInfo
             {
                 Manifest = manifest,
@@ -122,9 +126,10 @@ public class PluginService : IPluginService
 
             try
             {
-                var loadContext = new PluginLoadContext(Path.GetFullPath(pluginDir));
-                var asm = loadContext.LoadFromAssemblyPath(
-                    Path.GetFullPath(Path.Combine(pluginDir, manifest.EntranceAssembly)));
+                var fullPath = Path.GetFullPath(Path.Combine(pluginDir, manifest.EntranceAssembly));
+                var loadContext = new PluginLoadContext(fullPath);
+                var asm = loadContext.LoadFromAssemblyName(
+                    new AssemblyName(Path.GetFileNameWithoutExtension(fullPath)));
                 var entrance = asm.ExportedTypes.FirstOrDefault(x =>
                     x.BaseType == typeof(PluginBase) ||
                     x.GetCustomAttributes().FirstOrDefault(a => a.GetType() == typeof(PluginEntrance)) != null);
@@ -147,7 +152,7 @@ public class PluginService : IPluginService
                 services.AddSingleton(typeof(PluginBase), entranceObj);
                 services.AddSingleton(entrance, entranceObj);
                 info.LoadStatus = PluginLoadStatus.Loaded;
-                Console.WriteLine($"Initialize plugin: {pluginDir}");
+                Console.WriteLine($"Initialize plugin: {pluginDir} ({manifest.Version})");
             }
             catch (Exception ex)
             {
@@ -172,5 +177,4 @@ public class PluginService : IPluginService
             ZipFile.CreateFromDirectory(plugin.PluginFolderPath, outputPath);
         });
     }
-
 }
